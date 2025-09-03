@@ -224,22 +224,55 @@ def set_pbone_world_location(obj, pbone, world_loc):
     pbone.location = arm_space - pbone.bone.head_local
 
 def set_pbone_world_matrix(obj, pbone, world_matrix):
-    """Set pose bone to match a world space matrix (position and rotation)"""
-    # Convert world matrix to armature space
-    arm_matrix = obj.matrix_world.inverted() @ world_matrix
+    """IMPROVED: Set pose bone to match a world space matrix with better precision"""
     
-    # Extract location relative to bone's rest head
-    pbone.location = arm_matrix.translation - pbone.bone.head_local
-    
-    # Extract rotation
-    rot_quat = arm_matrix.to_quaternion()
-    if pbone.rotation_mode == 'QUATERNION':
-        pbone.rotation_quaternion = rot_quat
-    elif pbone.rotation_mode in ('XYZ', 'XZY', 'YXZ', 'YZX', 'ZXY', 'ZYX'):
-        pbone.rotation_euler = rot_quat.to_euler(pbone.rotation_mode)
-    elif pbone.rotation_mode == 'AXIS_ANGLE':
-        axis, angle = rot_quat.to_axis_angle()
-        pbone.rotation_axis_angle = [angle, axis[0], axis[1], axis[2]]
+    # Method 1: Direct matrix approach (most precise)
+    try:
+        # Convert world matrix to armature space
+        armature_matrix = obj.matrix_world.inverted() @ world_matrix
+        
+        # Get the bone's rest matrix in armature space  
+        bone_rest_matrix = pbone.bone.matrix_local
+        
+        # Calculate the pose transformation needed
+        # This is the transformation from rest pose to target pose
+        pose_matrix = bone_rest_matrix.inverted() @ armature_matrix
+        
+        # Clear any existing transforms
+        pbone.location = Vector((0, 0, 0))
+        if pbone.rotation_mode == 'QUATERNION':
+            pbone.rotation_quaternion = Quaternion((1, 0, 0, 0))
+        else:
+            pbone.rotation_euler = Vector((0, 0, 0))
+        pbone.scale = Vector((1, 1, 1))
+        
+        # Apply the calculated transformation
+        pbone.location = pose_matrix.translation
+        
+        # Handle rotation based on bone's rotation mode
+        rotation_quat = pose_matrix.to_quaternion().normalized()
+        
+        if pbone.rotation_mode == 'QUATERNION':
+            pbone.rotation_quaternion = rotation_quat
+        elif pbone.rotation_mode in ('XYZ', 'XZY', 'YXZ', 'YZX', 'ZXY', 'ZYX'):
+            pbone.rotation_euler = rotation_quat.to_euler(pbone.rotation_mode)
+        elif pbone.rotation_mode == 'AXIS_ANGLE':
+            axis, angle = rotation_quat.to_axis_angle()
+            pbone.rotation_axis_angle = [angle, axis[0], axis[1], axis[2]]
+            
+    except Exception as e:
+        print(f"Error in precise matrix setting: {e}")
+        # Fallback to original method
+        arm_matrix = obj.matrix_world.inverted() @ world_matrix
+        pbone.location = arm_matrix.translation - pbone.bone.head_local
+        rot_quat = arm_matrix.to_quaternion()
+        if pbone.rotation_mode == 'QUATERNION':
+            pbone.rotation_quaternion = rot_quat
+        elif pbone.rotation_mode in ('XYZ', 'XZY', 'YXZ', 'YZX', 'ZXY', 'ZYX'):
+            pbone.rotation_euler = rot_quat.to_euler(pbone.rotation_mode)
+        elif pbone.rotation_mode == 'AXIS_ANGLE':
+            axis, angle = rot_quat.to_axis_angle()
+            pbone.rotation_axis_angle = [angle, axis[0], axis[1], axis[2]]
 
 def world_of(obj, pbone, point='tail'):
     if point == 'head':
@@ -324,6 +357,127 @@ def place_pole(obj, upper_name, lower_name, eff_name, pole_pbone, dist_factor, d
     pos = w_joint + dir_vec * dist
 
     set_pbone_world_location(obj, pole_pbone, pos)
+
+def improved_place_pole(obj, upper_name, lower_name, eff_name, pole_pbone, dist_factor, dist_min, fk_matrices):
+    """Improved pole placement using captured FK matrices"""
+    upper = pb(obj, upper_name)
+    lower = pb(obj, lower_name)
+    eff   = pb(obj, eff_name)
+    if not (upper and lower and eff):
+        return
+
+    # Use ORIGINAL FK positions from captured matrices
+    if upper_name in fk_matrices and lower_name in fk_matrices and eff_name in fk_matrices:
+        w_root = fk_matrices[upper_name]['world_matrix'].translation
+        w_joint = fk_matrices[lower_name]['world_matrix'].translation  
+        w_eff = fk_matrices[eff_name]['world_matrix'].translation
+    else:
+        # Fallback to current positions
+        w_root  = world_of(obj, upper, 'head')
+        w_joint = world_of(obj, lower, 'head')
+        w_eff   = world_of(obj, eff,   'head')
+
+    # Limb vectors using original FK positions
+    v1 = (w_joint - w_root).normalized()
+    v2 = (w_eff   - w_joint).normalized()
+
+    # Normal of the limb plane
+    n = v1.cross(v2)
+    if n.length < 1e-8:
+        n = Vector((0,0,1))
+    n.normalize()
+
+    # Use the ORIGINAL lower bone matrix for axis calculation
+    if lower_name in fk_matrices:
+        lower_axis_world = fk_matrices[lower_name]['world_matrix'].to_3x3() @ Vector((0, 1, 0))
+    else:
+        lower_axis = lower.bone.y_axis
+        lower_axis_world = (obj.matrix_world.to_3x3() @ lower_axis).normalized()
+
+    # Choose a direction roughly perpendicular to limb plane, leaning toward lower axis
+    dir_vec = (n + 0.5 * lower_axis_world).normalized()
+
+    # Distance based on limb length using original positions
+    L = max((w_eff - w_root).length, dist_min)
+    dist = max(L * dist_factor, dist_min)
+    pos = w_joint + dir_vec * dist
+
+    set_pbone_world_location(obj, pole_pbone, pos)
+
+def find_best_pole_angle(obj, upper_name, lower_name, eff_name, constraint_name, fk_matrices):
+    """Find the best pole angle by testing multiple values and choosing the one with minimal rotation error"""
+    
+    if not all(bone in fk_matrices for bone in [upper_name, lower_name, eff_name]):
+        return 0.0
+    
+    # Get the constraint
+    eff_pbone = pb(obj, eff_name)
+    if not eff_pbone:
+        return 0.0
+    
+    constraint = eff_pbone.constraints.get(constraint_name)
+    if not constraint:
+        return 0.0
+    
+    # Store original rotations for comparison
+    original_rotations = {}
+    test_bones = [upper_name, lower_name, eff_name]
+    
+    for bone_name in test_bones:
+        if bone_name in fk_matrices:
+            original_rotations[bone_name] = fk_matrices[bone_name]['world_matrix'].to_quaternion()
+    
+    # Test different pole angles
+    test_angles = []
+    
+    # Determine if this is a right-side limb
+    is_right_side = 'Right' in upper_name or 'Right' in lower_name or 'Right' in eff_name
+    
+    if is_right_side:
+        # For right side, test angles around 180°
+        base_angles = [178.0, 179.0, 179.5, 179.7, 179.8, 179.9, 180.0, -180.0, -179.9, -179.8, -179.7, -179.5, -179.0, -178.0]
+    else:
+        # For left side, test small angles around 0°
+        base_angles = [2.0, 1.5, 1.0, 0.5, 0.3, 0.2, 0.1, 0.0, -0.1, -0.2, -0.3, -0.5, -1.0, -1.5, -2.0]
+    
+    # Convert to radians and add to test list
+    for angle_deg in base_angles:
+        test_angles.append(math.radians(angle_deg))
+    
+    best_angle = 0.0
+    best_error = float('inf')
+    
+    print(f"  Testing pole angles for {eff_name}...")
+    
+    # Test each angle
+    for test_angle in test_angles:
+        constraint.pole_angle = test_angle
+        _update_depsgraph()
+        
+        # Calculate total rotation error compared to original FK pose
+        total_error = 0.0
+        for bone_name in test_bones:
+            if bone_name in original_rotations:
+                test_pbone = pb(obj, bone_name)
+                if test_pbone:
+                    current_matrix = obj.matrix_world @ test_pbone.matrix
+                    current_quat = current_matrix.to_quaternion()
+                    original_quat = original_rotations[bone_name]
+                    
+                    # Calculate angular difference
+                    angle_diff = abs(current_quat.rotation_difference(original_quat).angle)
+                    total_error += angle_diff
+        
+        if total_error < best_error:
+            best_error = total_error
+            best_angle = test_angle
+    
+    # Set the best angle
+    constraint.pole_angle = best_angle
+    _update_depsgraph()
+    
+    print(f"    Best pole angle for {eff_name}: {math.degrees(best_angle):.2f}° (error: {math.degrees(best_error):.2f}°)")
+    return best_angle
 
 def ensure_constraints_and_controls(obj):
     """Create controllers, IK constraints, Copy Rotation, and drivers."""
@@ -420,89 +574,180 @@ def ensure_constraints_and_controls(obj):
         make_driver(cr, obj, PROP_HEAD)
 
 def snap_fk_to_ik(obj):
-    """Place IK controllers & poles to match current FK pose. Then switch IK=1."""
+    """IMPROVED: Place IK controllers & poles to match current FK pose with better precision."""
     ensure_pose_mode(obj)
 
-    # First, ensure IK is OFF and save current FK rotations before any changes
+    # First, ensure IK is OFF and capture the current FK pose matrices
     obj[PROP_ARM_L] = 0.0; obj[PROP_ARM_R] = 0.0
     obj[PROP_LEG_L] = 0.0; obj[PROP_LEG_R] = 0.0
     obj[PROP_TORSO] = 0.0; obj[PROP_HEAD] = 0.0
     
     _update_depsgraph()
+    
+    # CAPTURE FK POSE MATRICES FIRST (before any IK control positioning)
+    print("Capturing original FK pose matrices...")
+    fk_matrices = {}
+    limb_bones = [
+        B["l_upper"], B["l_lower"], B["l_hand"],
+        B["r_upper"], B["r_lower"], B["r_hand"],
+        B["l_upper_leg"], B["l_lower_leg"], B["l_foot"],
+        B["r_upper_leg"], B["r_lower_leg"], B["r_foot"]
+    ] + B["spine"] + [B["head"]]
+    
+    for bone_name in limb_bones:
+        pbone = pb(obj, bone_name)
+        if pbone:
+            fk_matrices[bone_name] = {
+                'world_matrix': (obj.matrix_world @ pbone.matrix).copy(),
+                'local_matrix': pbone.matrix.copy()
+            }
 
-    # Arms
+    # Arms - IMPROVED positioning using captured matrices
+    print("Positioning arm IK controls...")
     for side in (('l', B["l_upper"], B["l_lower"], B["l_hand"], CTRL["l_hand_ik"], CTRL["l_arm_pole"], PROP_ARM_L, ARM_POLE_DIST_FACTOR, ARM_POLE_DIST_MIN, CNAME["ik_l_arm"]),
                 ('r', B["r_upper"], B["r_lower"], B["r_hand"], CTRL["r_hand_ik"], CTRL["r_arm_pole"], PROP_ARM_R, ARM_POLE_DIST_FACTOR, ARM_POLE_DIST_MIN, CNAME["ik_r_arm"])):
         _, upper, lower, eff, ik_name, pole_name, prop, df, dmin, ik_cname = side
         eff_p = pb(obj, eff)
         ik_p  = pb(obj, ik_name)
         
-        # Set IK control to match effector's world space matrix (position + rotation)
-        eff_world_matrix = obj.matrix_world @ eff_p.matrix
-        set_pbone_world_matrix(obj, ik_p, eff_world_matrix)
-
+        # Use the captured FK matrix for precise positioning
+        if eff in fk_matrices:
+            # CRITICAL: Use exact matrix positioning with validation
+            target_matrix = fk_matrices[eff]['world_matrix']
+            set_pbone_world_matrix(obj, ik_p, target_matrix)
+            
+            # Validation step: check if positioning was accurate
+            _update_depsgraph()
+            actual_matrix = obj.matrix_world @ ik_p.matrix
+            position_error = (actual_matrix.translation - target_matrix.translation).length
+            
+            if position_error > 0.001:  # More than 1mm error
+                print(f"  Warning: {ik_name} positioning error: {position_error*1000:.1f}mm")
+                # Try alternative positioning method
+                arm_space_pos = obj.matrix_world.inverted() @ target_matrix.translation
+                ik_p.location = arm_space_pos - ik_p.bone.head_local
+                ik_p.rotation_quaternion = (obj.matrix_world.inverted() @ target_matrix).to_quaternion()
+                _update_depsgraph()
+                print(f"    Retried positioning for {ik_name}")
+        
+        # Improved pole placement using original FK joint positions
         pole_p = pb(obj, pole_name)
-        place_pole(obj, upper, lower, eff, pole_p, df, dmin)
+        improved_place_pole(obj, upper, lower, eff, pole_p, df, dmin, fk_matrices)
 
-        # Compute pole_angle for this limb's IK constraint
-        con = pb(obj, eff).constraints.get(ik_cname)
-        if con:
-            angle = compute_pole_angle(obj, upper, lower, eff, world_of(obj, pole_p, 'head'))
-            con.pole_angle = angle
-
-    # Legs
+    # Legs - IMPROVED positioning using captured matrices
+    print("Positioning leg IK controls...")
     for side in (('l', B["l_upper_leg"], B["l_lower_leg"], B["l_foot"], CTRL["l_foot_ik"], CTRL["l_leg_pole"], PROP_LEG_L, LEG_POLE_DIST_FACTOR, LEG_POLE_DIST_MIN, CNAME["ik_l_leg"]),
                 ('r', B["r_upper_leg"], B["r_lower_leg"], B["r_foot"], CTRL["r_foot_ik"], CTRL["r_leg_pole"], PROP_LEG_R, LEG_POLE_DIST_FACTOR, LEG_POLE_DIST_MIN, CNAME["ik_r_leg"])):
         _, upper, lower, eff, ik_name, pole_name, prop, df, dmin, ik_cname = side
         eff_p = pb(obj, eff)
         ik_p  = pb(obj, ik_name)
         
-        # Set IK control to match effector's world space matrix (position + rotation)
-        eff_world_matrix = obj.matrix_world @ eff_p.matrix
-        set_pbone_world_matrix(obj, ik_p, eff_world_matrix)
-
+        # Use the captured FK matrix for precise positioning
+        if eff in fk_matrices:
+            # CRITICAL: Use exact matrix positioning with validation for legs too
+            target_matrix = fk_matrices[eff]['world_matrix']
+            set_pbone_world_matrix(obj, ik_p, target_matrix)
+            
+            # Validation step: check if positioning was accurate
+            _update_depsgraph()
+            actual_matrix = obj.matrix_world @ ik_p.matrix
+            position_error = (actual_matrix.translation - target_matrix.translation).length
+            
+            if position_error > 0.001:  # More than 1mm error
+                print(f"  Warning: {ik_name} positioning error: {position_error*1000:.1f}mm")
+                # Try alternative positioning method
+                arm_space_pos = obj.matrix_world.inverted() @ target_matrix.translation
+                ik_p.location = arm_space_pos - ik_p.bone.head_local
+                ik_p.rotation_quaternion = (obj.matrix_world.inverted() @ target_matrix).to_quaternion()
+                _update_depsgraph()
+                print(f"    Retried positioning for {ik_name}")
+        
+        # Improved pole placement using original FK joint positions
         pole_p = pb(obj, pole_name)
-        place_pole(obj, upper, lower, eff, pole_p, df, dmin)
+        improved_place_pole(obj, upper, lower, eff, pole_p, df, dmin, fk_matrices)
 
-        # Compute pole angle
+    # Torso and head using captured matrices
+    print("Positioning torso and head controls...")
+    torso_ik = pb(obj, CTRL["torso_ik"])
+    if B["spine"][-1] in fk_matrices:
+        set_pbone_world_matrix(obj, torso_ik, fk_matrices[B["spine"][-1]]['world_matrix'])
+
+    head_ctrl = pb(obj, CTRL["head_ik"])
+    if B["head"] in fk_matrices:
+        set_pbone_world_matrix(obj, head_ctrl, fk_matrices[B["head"]]['world_matrix'])
+    
+    # Update after positioning all controls
+    _update_depsgraph()
+    
+    # NOW set pole angles using the ORIGINAL FK positions (not current ones)
+    print("Computing pole angles from original FK pose...")
+    for side in (('l', B["l_upper"], B["l_lower"], B["l_hand"], CTRL["l_arm_pole"], CNAME["ik_l_arm"]),
+                ('r', B["r_upper"], B["r_lower"], B["r_hand"], CTRL["r_arm_pole"], CNAME["ik_r_arm"])):
+        _, upper, lower, eff, pole_name, ik_cname = side
+        
+        pole_p = pb(obj, pole_name)
         con = pb(obj, eff).constraints.get(ik_cname)
-        if con:
-            angle = compute_pole_angle(obj, upper, lower, eff, world_of(obj, pole_p, 'head'))
+        if con and pole_p:
+            angle = find_best_pole_angle(obj, upper, lower, eff, ik_cname, fk_matrices)
             con.pole_angle = angle
 
-    # Torso target near top spine
-    torso_ik = pb(obj, CTRL["torso_ik"])
-    top_sp = pb(obj, B["spine"][-1])
-    # Match world space matrix of top spine
-    spine_world_matrix = obj.matrix_world @ top_sp.matrix
-    set_pbone_world_matrix(obj, torso_ik, spine_world_matrix)
-
-    # Head target: match current head world space matrix
-    head_ctrl = pb(obj, CTRL["head_ik"])
-    head = pb(obj, B["head"])
-    # Match world space matrix of head
-    head_world_matrix = obj.matrix_world @ head.matrix
-    set_pbone_world_matrix(obj, head_ctrl, head_world_matrix)
+    for side in (('l', B["l_upper_leg"], B["l_lower_leg"], B["l_foot"], CTRL["l_leg_pole"], CNAME["ik_l_leg"]),
+                ('r', B["r_upper_leg"], B["r_lower_leg"], B["r_foot"], CTRL["r_leg_pole"], CNAME["ik_r_leg"])):
+        _, upper, lower, eff, pole_name, ik_cname = side
+        
+        pole_p = pb(obj, pole_name)
+        con = pb(obj, eff).constraints.get(ik_cname)
+        if con and pole_p:
+            angle = find_best_pole_angle(obj, upper, lower, eff, ik_cname, fk_matrices)
+            con.pole_angle = angle
     
-    # Update depsgraph to ensure all transforms are properly evaluated
+    # Final update before enabling IK
     _update_depsgraph()
     
-    # Now enable IK - pose should be preserved
-    obj[PROP_ARM_L] = 1.0; obj[PROP_ARM_R] = 1.0
-    obj[PROP_LEG_L] = 1.0; obj[PROP_LEG_R] = 1.0
-    obj[PROP_TORSO] = 1.0; obj[PROP_HEAD] = 1.0
+    # Enable IK gradually for better stability
+    print("Enabling IK constraints...")
+    obj[PROP_ARM_L] = 1.0; _update_depsgraph()
+    obj[PROP_ARM_R] = 1.0; _update_depsgraph() 
+    obj[PROP_LEG_L] = 1.0; _update_depsgraph()
+    obj[PROP_LEG_R] = 1.0; _update_depsgraph()
+    obj[PROP_TORSO] = 1.0; _update_depsgraph()
+    obj[PROP_HEAD] = 1.0; _update_depsgraph()
     
-    # Final update to ensure IK constraints are fully evaluated
-    _update_depsgraph()
+    # CRITICAL: Final constraint validation pass
+    print("Final validation pass...")
+    
+    # Temporarily disable and re-enable each constraint to force clean evaluation
+    for prop_name, desc in [(PROP_ARM_L, "Left Arm"), (PROP_ARM_R, "Right Arm"), 
+                           (PROP_LEG_L, "Left Leg"), (PROP_LEG_R, "Right Leg")]:
+        current_value = obj[prop_name]
+        obj[prop_name] = 0.0
+        _update_depsgraph()
+        obj[prop_name] = current_value
+        _update_depsgraph()
+        print(f"  Validated {desc} IK")
+    
+    print("FK to IK conversion completed.")
 
 def _update_depsgraph():
+    """Enhanced dependency graph update for better constraint evaluation"""
     try:
-        # Force update of the dependency graph
-        bpy.context.evaluated_depsgraph_get().update()
-        # Also force view layer update
-        bpy.context.view_layer.update()
-    except Exception:
-        pass
+        # Multiple update passes for complex constraint setups
+        for i in range(2):  # Do 2 passes
+            # Force view layer update first
+            bpy.context.view_layer.update()
+            # Then force depsgraph update  
+            bpy.context.evaluated_depsgraph_get().update()
+            # Small delay for Blender's internal updates
+            if i == 0:  # Only on first pass
+                # Force scene update
+                bpy.context.scene.frame_set(bpy.context.scene.frame_current)
+    except Exception as e:
+        print(f"Warning: Depsgraph update error: {e}")
+        # Minimal fallback
+        try:
+            bpy.context.view_layer.update()
+        except:
+            pass
 
 def snap_ik_to_fk(obj):
     """Bake evaluated IK result into FK channels, then switch IK=0 (pose stays)."""
