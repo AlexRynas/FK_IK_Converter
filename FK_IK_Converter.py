@@ -14,15 +14,15 @@ from math import atan2
 # CONFIG (you can tweak)
 # ----------------------------
 # Distances for placing pole targets, scaled by limb length:
-ARM_POLE_DIST_FACTOR = 0.7
-LEG_POLE_DIST_FACTOR = 0.7
+ARM_POLE_DIST_FACTOR = 0.9
+LEG_POLE_DIST_FACTOR = 0.9
 # Absolute fallback distances if limb length is tiny (meters)
-ARM_POLE_DIST_MIN = 0.2
-LEG_POLE_DIST_MIN = 0.2
+ARM_POLE_DIST_MIN = 0.5
+LEG_POLE_DIST_MIN = 0.5
 
 # IK target offsets (how far to place targets away from effector in local axis dir, meters)
-HAND_IK_OFFSET = 0.0   # place on hand position
-FOOT_IK_OFFSET = 0.0   # place on foot position
+HAND_IK_OFFSET = 0.2   # place on hand position
+FOOT_IK_OFFSET = 0.2   # place on foot position
 
 # Property names stored on the Armature object
 PROP_ARM_L = "ik_arm_L"
